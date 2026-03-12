@@ -35,6 +35,7 @@
                 @endphp
                 <div class="col-auto ms-auto d-print-none">
                     <a href="{{ route('projects.index') }}" class="btn btn-outline-secondary">Volver al listado</a>
+                    <a href="{{ route('projects.versions.index', $project) }}" class="btn btn-outline-primary">Ver historial</a>
                     @if ($normalizedStatus === 'devuelto para correccion')
                         <a href="{{ route('projects.edit', $project) }}" class="btn btn-primary">Editar</a>
                     @endif
@@ -263,6 +264,7 @@
         }
     </style>
 @endpush
+
 
 
 
