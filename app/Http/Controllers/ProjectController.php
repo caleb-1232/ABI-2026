@@ -33,6 +33,7 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Illuminate\Validation\Rule;
 use Illuminate\View\View;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class ProjectController extends Controller
 {
@@ -51,7 +52,7 @@ class ProjectController extends Controller
     /**
      * Display a paginated list of projects for the authenticated user.
      */
-    public function index(Request $request): View
+    public function index(Request $request): View|StreamedResponse
     {
         $user = AuthUserHelper::fullUser();
 
@@ -108,6 +109,19 @@ class ProjectController extends Controller
         }
 
         $projects = $query->paginate(10)->withQueryString();
+        $reportState = $this->emptyProjectReportState();
+
+        if ($user?->role === 'research_staff') {
+            $reportState = $this->buildProjectReportState($request, $user);
+
+            if ($reportState['export'] === 'csv') {
+                return $this->streamProjectReportCsv(
+                    $reportState['reportKey'],
+                    $reportState['reportLabel'],
+                    $reportState['reportData']
+                );
+            }
+        }
 
         $projectAgeReviewService = app(ProjectAgeReviewService::class);
         $projects->getCollection()->transform(function (Project $project) use ($projectAgeReviewService) {
@@ -157,6 +171,390 @@ class ProjectController extends Controller
             'proposalWindowMessage' => $proposalWindowMessage,
             'activeAcademicPeriod' => $activeAcademicPeriod,
             'canCreateProject' => (in_array($user?->role, ['professor', 'committee_leader'], true) || ($user?->role === 'student' && $enableButtonStudent)) && $proposalWindowOpen,
+            'reportModules' => $this->projectReportModules(),
+            'reportFilters' => $reportState['filters'],
+            'reportData' => $reportState['reportData'],
+            'reportSegments' => $reportState['segments'],
+            'activeReportKey' => $reportState['reportKey'],
+            'reportProgramOptions' => Program::query()
+                ->selectRaw('MIN(id) as id, name')
+                ->groupBy('name')
+                ->orderBy('name')
+                ->get(),
+        ]);
+    }
+
+    /**
+     * Build the report state rendered below the projects list.
+     *
+     * @return array{
+     *     filters: array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int},
+     *     reportKey: string,
+     *     reportLabel: string,
+     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
+     *     export: ?string
+     * }
+     */
+    protected function buildProjectReportState(Request $request, ?User $user): array
+    {
+        $filters = $request->validate([
+            'report_key' => ['nullable', Rule::in(array_keys($this->projectReportModules()))],
+            'report_search' => ['nullable', 'string', 'max:120'],
+            'report_from' => ['nullable', 'date'],
+            'report_to' => ['nullable', 'date', 'after_or_equal:report_from'],
+            'report_program_id' => ['nullable', 'integer', 'exists:programs,id'],
+            'report_export' => ['nullable', Rule::in(['csv'])],
+        ]);
+
+        $reportKey = $filters['report_key'] ?? 'projects_by_status';
+        $reportModules = $this->projectReportModules();
+        $reportLabel = $reportModules[$reportKey]['label'] ?? $reportModules['projects_by_status']['label'];
+        $normalizedFilters = [
+            'report_key' => $reportKey,
+            'report_search' => isset($filters['report_search']) ? trim((string) $filters['report_search']) : null,
+            'report_from' => $filters['report_from'] ?? null,
+            'report_to' => $filters['report_to'] ?? null,
+            'report_program_id' => isset($filters['report_program_id']) ? (int) $filters['report_program_id'] : null,
+        ];
+
+        $reportData = $this->generateProjectDistributionReport($reportKey, $normalizedFilters, $user);
+
+        return [
+            'filters' => $normalizedFilters,
+            'reportKey' => $reportKey,
+            'reportLabel' => $reportLabel,
+            'reportData' => $reportData,
+            'segments' => $this->buildProjectReportSegments($reportData),
+            'export' => $filters['report_export'] ?? null,
+        ];
+    }
+
+    /**
+     * @return array{
+     *     filters: array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int},
+     *     reportKey: string,
+     *     reportLabel: string,
+     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
+     *     export: null
+     * }
+     */
+    protected function emptyProjectReportState(): array
+    {
+        return [
+            'filters' => [
+                'report_key' => 'projects_by_status',
+                'report_search' => null,
+                'report_from' => null,
+                'report_to' => null,
+                'report_program_id' => null,
+            ],
+            'reportKey' => 'projects_by_status',
+            'reportLabel' => 'Proyectos por estado',
+            'reportData' => [
+                'categories' => [],
+                'values' => [],
+                'percentages' => [],
+                'total' => 0,
+            ],
+            'segments' => [],
+            'export' => null,
+        ];
+    }
+
+    /**
+     * @return array<string, array{label: string, description: string}>
+     */
+    protected function projectReportModules(): array
+    {
+        return [
+            'projects_by_status' => [
+                'label' => 'Proyectos por estado',
+                'description' => 'Compara la distribucion de proyectos segun su estado actual.',
+            ],
+            'projects_by_author_type' => [
+                'label' => 'Proyectos por tipo de autor',
+                'description' => 'Clasifica cada proyecto segun si participan estudiantes, docentes o ambos tipos de autores.',
+            ],
+            'projects_by_thematic_area' => [
+                'label' => 'Proyectos por area tematica',
+                'description' => 'Muestra que areas tematicas concentran mayor cantidad de proyectos.',
+            ],
+            'projects_by_investigation_line' => [
+                'label' => 'Proyectos por linea de investigacion',
+                'description' => 'Permite comparar los proyectos agrupados por linea de investigacion.',
+            ],
+        ];
+    }
+
+    /**
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     * @return array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int}
+     */
+    protected function generateProjectDistributionReport(string $reportKey, array $filters, ?User $user): array
+    {
+        $query = $this->baseProjectReportQuery($user);
+
+        match ($reportKey) {
+            'projects_by_author_type' => $this->applyAuthorTypeDistribution($query),
+            'projects_by_thematic_area' => $this->applyThematicAreaDistribution($query),
+            'projects_by_investigation_line' => $this->applyInvestigationLineDistribution($query),
+            default => $this->applyStatusDistribution($query),
+        };
+
+        $this->applyProjectReportFilters($query, $filters, $reportKey);
+
+        $rows = $query->get();
+        $categories = [];
+        $values = [];
+
+        foreach ($rows as $row) {
+            $categories[] = (string) $row->category;
+            $values[] = (int) $row->total;
+        }
+
+        $total = array_sum($values);
+        $percentages = array_map(
+            static fn (int $value): float => $total > 0 ? round(($value / $total) * 100, 2) : 0.0,
+            $values
+        );
+
+        return [
+            'categories' => $categories,
+            'values' => $values,
+            'percentages' => $percentages,
+            'total' => $total,
+        ];
+    }
+
+    protected function baseProjectReportQuery(?User $user): Builder
+    {
+        $query = Project::query()->from('projects');
+
+        if (in_array($user?->role, ['professor', 'committee_leader'], true) && $user?->professor) {
+            $professorId = $user->professor->id;
+
+            $query->whereHas('professors', static function (Builder $relation) use ($professorId) {
+                $relation->where('professors.id', $professorId);
+            });
+        } elseif ($user?->role === 'student' && $user->student) {
+            $studentId = $user->student->id;
+
+            $query->whereHas('students', static function (Builder $relation) use ($studentId) {
+                $relation->where('students.id', $studentId);
+            });
+        }
+
+        return $query;
+    }
+
+    protected function applyStatusDistribution(Builder $query): void
+    {
+        $query
+            ->leftJoin('project_statuses', 'project_statuses.id', '=', 'projects.project_status_id')
+            ->selectRaw("COALESCE(project_statuses.name, 'Sin estado') as category")
+            ->selectRaw('COUNT(projects.id) as total')
+            ->groupBy('category')
+            ->orderByDesc('total');
+    }
+
+    protected function applyThematicAreaDistribution(Builder $query): void
+    {
+        $query
+            ->leftJoin('thematic_areas', 'thematic_areas.id', '=', 'projects.thematic_area_id')
+            ->selectRaw("COALESCE(thematic_areas.name, 'Sin area tematica') as category")
+            ->selectRaw('COUNT(projects.id) as total')
+            ->groupBy('category')
+            ->orderByDesc('total');
+    }
+
+    protected function applyAuthorTypeDistribution(Builder $query): void
+    {
+        $categoryExpression = $this->projectAuthorTypeCategoryExpression();
+
+        $query
+            ->selectRaw("{$categoryExpression} as category")
+            ->selectRaw('COUNT(projects.id) as total')
+            ->groupBy('category')
+            ->orderByRaw(
+                "CASE {$categoryExpression}
+                    WHEN 'Estudiante' THEN 1
+                    WHEN 'Docente' THEN 2
+                    WHEN 'Mixto' THEN 3
+                    ELSE 4
+                END"
+            );
+    }
+
+    protected function projectAuthorTypeCategoryExpression(): string
+    {
+        return <<<SQL
+CASE
+    WHEN EXISTS (
+        SELECT 1
+        FROM student_project
+        WHERE student_project.project_id = projects.id
+    ) AND EXISTS (
+        SELECT 1
+        FROM professor_project
+        WHERE professor_project.project_id = projects.id
+    ) THEN 'Mixto'
+    WHEN EXISTS (
+        SELECT 1
+        FROM student_project
+        WHERE student_project.project_id = projects.id
+    ) THEN 'Estudiante'
+    WHEN EXISTS (
+        SELECT 1
+        FROM professor_project
+        WHERE professor_project.project_id = projects.id
+    ) THEN 'Docente'
+    ELSE 'Sin autores'
+END
+SQL;
+    }
+
+    protected function applyInvestigationLineDistribution(Builder $query): void
+    {
+        $query
+            ->leftJoin('thematic_areas', 'thematic_areas.id', '=', 'projects.thematic_area_id')
+            ->leftJoin('investigation_lines', 'investigation_lines.id', '=', 'thematic_areas.investigation_line_id')
+            ->selectRaw("COALESCE(investigation_lines.name, 'Sin linea de investigacion') as category")
+            ->selectRaw('COUNT(projects.id) as total')
+            ->groupBy('category')
+            ->orderByDesc('total');
+    }
+
+    /**
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     */
+    protected function applyProjectReportFilters(Builder $query, array $filters, string $reportKey): void
+    {
+        if ($filters['report_program_id']) {
+            $programId = $filters['report_program_id'];
+
+            $query->where(function (Builder $builder) use ($programId): void {
+                $builder
+                    ->whereHas('professors.cityProgram', static function (Builder $relation) use ($programId): void {
+                        $relation->where('program_id', $programId);
+                    })
+                    ->orWhereHas('students.cityProgram', static function (Builder $relation) use ($programId): void {
+                        $relation->where('program_id', $programId);
+                    });
+            });
+        }
+
+        if ($filters['report_from']) {
+            $from = $filters['report_from'];
+
+            $query->where(static function (Builder $builder) use ($from): void {
+                $builder
+                    ->whereDate('projects.proposed_at', '>=', $from)
+                    ->orWhere(static function (Builder $fallback) use ($from): void {
+                        $fallback
+                            ->whereNull('projects.proposed_at')
+                            ->whereDate('projects.created_at', '>=', $from);
+                    });
+            });
+        }
+
+        if ($filters['report_to']) {
+            $to = $filters['report_to'];
+
+            $query->where(static function (Builder $builder) use ($to): void {
+                $builder
+                    ->whereDate('projects.proposed_at', '<=', $to)
+                    ->orWhere(static function (Builder $fallback) use ($to): void {
+                        $fallback
+                            ->whereNull('projects.proposed_at')
+                            ->whereDate('projects.created_at', '<=', $to);
+                    });
+            });
+        }
+
+        if ($filters['report_search']) {
+            $term = '%' . $filters['report_search'] . '%';
+
+            $query->where(function (Builder $builder) use ($term, $reportKey): void {
+                $builder->where('projects.title', 'like', $term);
+
+                match ($reportKey) {
+                    'projects_by_author_type' => $builder->orWhereRaw($this->projectAuthorTypeCategoryExpression() . ' like ?', [$term]),
+                    'projects_by_thematic_area' => $builder->orWhere('thematic_areas.name', 'like', $term),
+                    'projects_by_investigation_line' => $builder
+                        ->orWhere('thematic_areas.name', 'like', $term)
+                        ->orWhere('investigation_lines.name', 'like', $term),
+                    default => $builder->orWhere('project_statuses.name', 'like', $term),
+                };
+            });
+        }
+    }
+
+    /**
+     * @param  array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int}  $reportData
+     * @return array<int, array{label: string, value: int, percentage: float, color: string}>
+     */
+    protected function buildProjectReportSegments(array $reportData): array
+    {
+        $palette = [
+            '#0f766e',
+            '#1d4ed8',
+            '#b45309',
+            '#be123c',
+            '#7c3aed',
+            '#0891b2',
+            '#4d7c0f',
+            '#c2410c',
+        ];
+
+        $segments = [];
+
+        foreach ($reportData['categories'] as $index => $category) {
+            $segments[] = [
+                'label' => $category,
+                'value' => $reportData['values'][$index] ?? 0,
+                'percentage' => $reportData['percentages'][$index] ?? 0.0,
+                'color' => $palette[$index % count($palette)],
+            ];
+        }
+
+        return $segments;
+    }
+
+    /**
+     * @param  array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int}  $reportData
+     */
+    protected function streamProjectReportCsv(string $reportKey, string $reportLabel, array $reportData): StreamedResponse
+    {
+        $filename = sprintf(
+            'reporte-%s-%s.csv',
+            str_replace('_', '-', $reportKey),
+            now()->format('Ymd-His')
+        );
+
+        return response()->streamDownload(function () use ($reportLabel, $reportData): void {
+            $handle = fopen('php://output', 'wb');
+
+            if ($handle === false) {
+                return;
+            }
+
+            fputcsv($handle, [$reportLabel]);
+            fputcsv($handle, ['Categoria', 'Valor', 'Porcentaje']);
+
+            foreach ($reportData['categories'] as $index => $category) {
+                fputcsv($handle, [
+                    $category,
+                    $reportData['values'][$index] ?? 0,
+                    $reportData['percentages'][$index] ?? 0,
+                ]);
+            }
+
+            fputcsv($handle, ['Total', $reportData['total'], 100]);
+            fclose($handle);
+        }, $filename, [
+            'Content-Type' => 'text/csv; charset=UTF-8',
         ]);
     }
 
