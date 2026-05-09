@@ -71,7 +71,7 @@
                             <label for="search" class="form-label">Buscar</label>
                             <div class="input-group">
                                 {{-- Input element used to capture the 'search' value. --}}
-                                <input type="text" name="search" id="search" value="{{ $search ?? '' }}" class="form-control" placeholder="Email, nombre, cÃ©dulaâ€¦">
+                                <input type="text" name="search" id="search" value="{{ $search ?? '' }}" class="form-control" placeholder="Email, nombre, cédula">
                                 @if(!empty($search) || !empty($role) || !empty($state) || !empty($cityProgramId) || ($perPage ?? 10) != 10)
                                     <a href="{{ route('users.index') }}" class="input-group-text" title="Limpiar filtros">
                                         <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="20" height="20" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" fill="none" stroke-linecap="round" stroke-linejoin="round">
@@ -159,9 +159,9 @@
                                 <th class="text-truncate" style="max-width: 160px;">Rol</th>
                                 <th class="text-truncate" style="max-width: 140px;">Estado</th>
                                 <th class="text-truncate" style="max-width: 220px;">Nombre</th>
-                                <th class="text-truncate" style="max-width: 160px;">CÃ©dula</th>
+                                <th class="text-truncate" style="max-width: 160px;">Cédula</th>
                                 <th class="text-truncate" style="max-width: 240px;">Programa</th>
-                                <th class="text-truncate" style="max-width: 160px;">Semestre/LÃ­der</th>
+                                <th class="text-truncate" style="max-width: 160px;">Semestre</th>
                                 <th class="w-1 text-center">Acciones</th>
                             </tr>
                         </thead>
@@ -223,7 +223,7 @@
                                     @elseif(in_array($user->role, ['professor', 'committee_leader']) && $user->details)
                                         <span class="badge bg-secondary-lt">{{ $user->details->committee_leader ? 'Lí­der' : 'Docente' }}</span>
                                     @else
-                                        <span class="text-muted">â€”</span>
+                                        <span class="text-muted">No aplica</span>
                                     @endif
                                 </td>
                                 <td>
