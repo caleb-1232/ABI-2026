@@ -23,11 +23,13 @@ use App\Services\AcademicCalendar\AcademicCalendarService;
 use App\Services\Projects\ProjectAgeReviewService;
 use App\Services\Projects\TeacherIdeaBalanceService;
 use App\Services\Students\StudentAcademicProgressService;
+use Barryvdh\DomPDF\Facade\Pdf;
 use Carbon\Carbon;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
@@ -52,7 +54,7 @@ class ProjectController extends Controller
     /**
      * Display a paginated list of projects for the authenticated user.
      */
-    public function index(Request $request): View|StreamedResponse
+    public function index(Request $request): View|StreamedResponse|Response
     {
         $user = AuthUserHelper::fullUser();
 
@@ -117,9 +119,13 @@ class ProjectController extends Controller
             if ($reportState['export'] === 'csv') {
                 return $this->streamProjectReportCsv(
                     $reportState['reportKey'],
-                    $reportState['reportLabel'],
+                    $reportState['exportLabel'],
                     $reportState['reportData']
                 );
+            }
+
+            if ($reportState['export'] === 'pdf') {
+                return $this->downloadProjectReportPdf($reportState);
             }
         }
 
@@ -175,6 +181,9 @@ class ProjectController extends Controller
             'reportFilters' => $reportState['filters'],
             'reportData' => $reportState['reportData'],
             'reportSegments' => $reportState['segments'],
+            'reportVisuals' => $reportState['visuals'],
+            'reportInsights' => $reportState['insights'],
+            'reportTable' => $reportState['table'],
             'activeReportKey' => $reportState['reportKey'],
             'reportProgramOptions' => Program::query()
                 ->selectRaw('MIN(id) as id, name')
@@ -186,15 +195,6 @@ class ProjectController extends Controller
 
     /**
      * Build the report state rendered below the projects list.
-     *
-     * @return array{
-     *     filters: array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int},
-     *     reportKey: string,
-     *     reportLabel: string,
-     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
-     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
-     *     export: ?string
-     * }
      */
     protected function buildProjectReportState(Request $request, ?User $user): array
     {
@@ -204,7 +204,7 @@ class ProjectController extends Controller
             'report_from' => ['nullable', 'date'],
             'report_to' => ['nullable', 'date', 'after_or_equal:report_from'],
             'report_program_id' => ['nullable', 'integer', 'exists:programs,id'],
-            'report_export' => ['nullable', Rule::in(['csv'])],
+            'report_export' => ['nullable', Rule::in(['csv', 'pdf'])],
         ]);
 
         $reportKey = $filters['report_key'] ?? 'projects_by_status';
@@ -218,28 +218,22 @@ class ProjectController extends Controller
             'report_program_id' => isset($filters['report_program_id']) ? (int) $filters['report_program_id'] : null,
         ];
 
-        $reportData = $this->generateProjectDistributionReport($reportKey, $normalizedFilters, $user);
+        $reportState = $this->composeProjectReportState($reportKey, $normalizedFilters, $user);
 
         return [
             'filters' => $normalizedFilters,
             'reportKey' => $reportKey,
             'reportLabel' => $reportLabel,
-            'reportData' => $reportData,
-            'segments' => $this->buildProjectReportSegments($reportData),
+            'reportData' => $reportState['reportData'],
+            'segments' => $reportState['segments'],
+            'visuals' => $reportState['visuals'],
+            'insights' => $reportState['insights'],
+            'table' => $reportState['table'],
+            'exportLabel' => $reportState['exportLabel'],
             'export' => $filters['report_export'] ?? null,
         ];
     }
 
-    /**
-     * @return array{
-     *     filters: array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int},
-     *     reportKey: string,
-     *     reportLabel: string,
-     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
-     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
-     *     export: null
-     * }
-     */
     protected function emptyProjectReportState(): array
     {
         return [
@@ -259,6 +253,10 @@ class ProjectController extends Controller
                 'total' => 0,
             ],
             'segments' => [],
+            'visuals' => [],
+            'insights' => [],
+            'table' => null,
+            'exportLabel' => 'Proyectos por estado',
             'export' => null,
         ];
     }
@@ -285,6 +283,397 @@ class ProjectController extends Controller
                 'label' => 'Proyectos por linea de investigacion',
                 'description' => 'Permite comparar los proyectos agrupados por linea de investigacion.',
             ],
+            'projects_programs_and_lines' => [
+                'label' => 'Programas y lineas',
+                'description' => 'Relaciona programas con propuestas y destaca las lineas de investigacion mas usadas.',
+            ],
+            'projects_traceability' => [
+                'label' => 'Trazabilidad basica',
+                'description' => 'Resume los proyectos con mas versiones y muestra comentarios de correccion cuando existan.',
+            ],
+        ];
+    }
+
+    /**
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     * @return array{
+     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
+     *     visuals: array<int, array{
+     *         key: string,
+     *         title: string,
+     *         description: string,
+     *         total_label: string,
+     *         data: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *         segments: array<int, array{label: string, value: int, percentage: float, color: string}>
+     *     }>,
+     *     insights: array<int, array{label: string, value: string, caption: string}>,
+     *     table: ?array{
+     *         title: string,
+     *         description: string,
+     *         columns: array<int, string>,
+     *         rows: array<int, array<int, string>>
+     *     },
+     *     exportLabel: string
+     * }
+     */
+    protected function composeProjectReportState(string $reportKey, array $filters, ?User $user): array
+    {
+        return match ($reportKey) {
+            'projects_programs_and_lines' => $this->buildProgramsAndLinesReportState($filters, $user),
+            'projects_traceability' => $this->buildTraceabilityReportState($filters, $user),
+            default => $this->buildStandardDistributionReportState($reportKey, $filters, $user),
+        };
+    }
+
+    /**
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     * @return array{
+     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
+     *     visuals: array<int, array{
+     *         key: string,
+     *         title: string,
+     *         description: string,
+     *         total_label: string,
+     *         data: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *         segments: array<int, array{label: string, value: int, percentage: float, color: string}>
+     *     }>,
+     *     insights: array<int, array{label: string, value: string, caption: string}>,
+     *     table: null,
+     *     exportLabel: string
+     * }
+     */
+    protected function buildStandardDistributionReportState(string $reportKey, array $filters, ?User $user): array
+    {
+        $reportModules = $this->projectReportModules();
+        $reportLabel = $reportModules[$reportKey]['label'] ?? 'Distribucion';
+        $reportDescription = $reportModules[$reportKey]['description'] ?? 'Distribucion de proyectos.';
+        $reportData = $this->generateProjectDistributionReport($reportKey, $filters, $user);
+        $segments = $this->buildProjectReportSegments($reportData);
+        $topSegment = collect($segments)->sortByDesc('value')->first();
+
+        return [
+            'reportData' => $reportData,
+            'segments' => $segments,
+            'visuals' => [
+                $this->makeProjectReportVisual(
+                    'primary-distribution',
+                    $reportLabel,
+                    $reportDescription,
+                    $reportData,
+                    'Total de proyectos'
+                ),
+            ],
+            'insights' => [
+                [
+                    'label' => 'Total de registros',
+                    'value' => (string) $reportData['total'],
+                    'caption' => 'Proyectos incluidos con los filtros actuales.',
+                ],
+                [
+                    'label' => 'Categorias detectadas',
+                    'value' => (string) count($reportData['categories']),
+                    'caption' => 'Cantidad de grupos comparados en el reporte.',
+                ],
+                [
+                    'label' => 'Categoria principal',
+                    'value' => (string) ($topSegment['label'] ?? 'Sin datos'),
+                    'caption' => 'Grupo con mayor concentracion de proyectos.',
+                ],
+            ],
+            'table' => null,
+            'exportLabel' => $reportLabel,
+        ];
+    }
+
+    /**
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     * @return array{
+     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
+     *     visuals: array<int, array{
+     *         key: string,
+     *         title: string,
+     *         description: string,
+     *         total_label: string,
+     *         data: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *         segments: array<int, array{label: string, value: int, percentage: float, color: string}>
+     *     }>,
+     *     insights: array<int, array{label: string, value: string, caption: string}>,
+     *     table: null,
+     *     exportLabel: string
+     * }
+     */
+    protected function buildProgramsAndLinesReportState(array $filters, ?User $user): array
+    {
+        $projects = $this->programsAndLinesProjectsQuery($filters, $user)->get();
+
+        $programCounts = $projects
+            ->flatMap(function (Project $project) {
+                return collect($project->professors
+                    ->map(fn (Professor $professor) => $professor->cityProgram?->program?->name)
+                    ->all())
+                    ->concat($project->students->map(fn (Student $student) => $student->cityProgram?->program?->name)->all())
+                    ->filter()
+                    ->map(fn (string $programName) => trim($programName))
+                    ->unique()
+                    ->values();
+            })
+            ->countBy()
+            ->sortDesc();
+
+        $lineCounts = $projects
+            ->map(function (Project $project): string {
+                return $project->thematicArea?->investigationLine?->name ?? 'Sin linea de investigacion';
+            })
+            ->countBy()
+            ->sortDesc();
+
+        $programReportData = $this->reportDataFromLabelCounts($programCounts->all());
+        $leastProgramReportData = $this->reportDataFromLabelCounts(
+            $programCounts
+                ->sort()
+                ->take(6)
+                ->all()
+        );
+        $lineReportData = $this->reportDataFromLabelCounts(
+            $lineCounts
+                ->take(8)
+                ->all()
+        );
+
+        $primaryVisual = $this->makeProjectReportVisual(
+            'program-proposals',
+            'Programas con propuestas registradas',
+            'Cuenta las propuestas asociadas a cada programa academico.',
+            $programReportData,
+            'Propuestas contabilizadas'
+        );
+
+        $topProgram = $programCounts->keys()->first();
+        $topProgramValue = $topProgram !== null ? (int) $programCounts->get($topProgram, 0) : 0;
+        $bottomProgram = $programCounts->sort()->keys()->first();
+        $bottomProgramValue = $bottomProgram !== null ? (int) $programCounts->get($bottomProgram, 0) : 0;
+        $topLine = $lineCounts->keys()->first();
+        $topLineValue = $topLine !== null ? (int) $lineCounts->get($topLine, 0) : 0;
+
+        return [
+            'reportData' => $primaryVisual['data'],
+            'segments' => $primaryVisual['segments'],
+            'visuals' => [
+                $primaryVisual,
+                $this->makeProjectReportVisual(
+                    'program-least-proposals',
+                    'Programas con menos propuestas',
+                    'Resalta los programas con menor numero de propuestas dentro del filtro actual.',
+                    $leastProgramReportData,
+                    'Propuestas contabilizadas'
+                ),
+                $this->makeProjectReportVisual(
+                    'investigation-lines-most-used',
+                    'Lineas de investigacion mas usadas',
+                    'Mide que lineas concentran mas proyectos propuestos.',
+                    $lineReportData,
+                    'Proyectos asociados'
+                ),
+            ],
+            'insights' => [
+                [
+                    'label' => 'Proyectos analizados',
+                    'value' => (string) $projects->count(),
+                    'caption' => 'Base total usada para comparar programas y lineas.',
+                ],
+                [
+                    'label' => 'Programa con mas propuestas',
+                    'value' => $topProgram ? "{$topProgram} ({$topProgramValue})" : 'Sin datos',
+                    'caption' => 'Mayor concentracion de propuestas en el rango filtrado.',
+                ],
+                [
+                    'label' => 'Programa con menos propuestas',
+                    'value' => $bottomProgram ? "{$bottomProgram} ({$bottomProgramValue})" : 'Sin datos',
+                    'caption' => 'Programa con menor participacion dentro del reporte.',
+                ],
+                [
+                    'label' => 'Linea mas usada',
+                    'value' => $topLine ? "{$topLine} ({$topLineValue})" : 'Sin datos',
+                    'caption' => 'Linea de investigacion con mayor uso en proyectos.',
+                ],
+            ],
+            'table' => null,
+            'exportLabel' => 'Programas con propuestas registradas',
+        ];
+    }
+
+    /**
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     * @return array{
+     *     reportData: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>,
+     *     visuals: array<int, array{
+     *         key: string,
+     *         title: string,
+     *         description: string,
+     *         total_label: string,
+     *         data: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *         segments: array<int, array{label: string, value: int, percentage: float, color: string}>
+     *     }>,
+     *     insights: array<int, array{label: string, value: string, caption: string}>,
+     *     table: array{
+     *         title: string,
+     *         description: string,
+     *         columns: array<int, string>,
+     *         rows: array<int, array<int, string>>
+     *     },
+     *     exportLabel: string
+     * }
+     */
+    protected function buildTraceabilityReportState(array $filters, ?User $user): array
+    {
+        $commentContentIds = $this->commentContentIds();
+        $query = $this->traceabilityProjectsQuery($filters, $user, $commentContentIds);
+
+        $projects = (clone $query)
+            ->withCount('versions')
+            ->orderByDesc('versions_count')
+            ->orderBy('title')
+            ->get(['projects.id', 'projects.title']);
+
+        $totalProjects = $projects->count();
+        $totalVersions = (int) $projects->sum('versions_count');
+        $projectsWithComments = (clone $query)
+            ->where(function (Builder $builder) use ($commentContentIds): void {
+                $this->applyCorrectionCommentsPresenceFilter($builder, $commentContentIds);
+            })
+            ->distinct()
+            ->count('projects.id');
+
+        $topProjects = $projects
+            ->take(8)
+            ->mapWithKeys(function (Project $project) {
+                return [$project->title => (int) $project->versions_count];
+            });
+
+        $versionBuckets = $projects
+            ->map(function (Project $project) {
+                $versionsCount = (int) $project->versions_count;
+
+                return match (true) {
+                    $versionsCount <= 1 => '1 version',
+                    $versionsCount === 2 => '2 versiones',
+                    $versionsCount === 3 => '3 versiones',
+                    default => '4 o mas versiones',
+                };
+            })
+            ->countBy();
+
+        $commentsPresenceData = $this->reportDataFromLabelCounts([
+            'Con comentarios de correccion' => $projectsWithComments,
+            'Sin comentarios registrados' => max($totalProjects - $projectsWithComments, 0),
+        ]);
+
+        $topVersionsData = $this->reportDataFromLabelCounts($topProjects->all());
+        $versionBucketData = $this->reportDataFromLabelCounts([
+            '1 version' => $versionBuckets['1 version'] ?? 0,
+            '2 versiones' => $versionBuckets['2 versiones'] ?? 0,
+            '3 versiones' => $versionBuckets['3 versiones'] ?? 0,
+            '4 o mas versiones' => $versionBuckets['4 o mas versiones'] ?? 0,
+        ]);
+
+        $topProjectIds = $projects->take(12)->pluck('id');
+        $projectDetails = Project::query()
+            ->with([
+                'versions' => static fn ($relation) => $relation
+                    ->with(['contentVersions.content'])
+                    ->orderByDesc('created_at'),
+                'stageHistories' => static fn ($relation) => $relation
+                    ->where('stage', 'returned_for_correction')
+                    ->orderByDesc('event_at')
+                    ->orderByDesc('id'),
+            ])
+            ->whereIn('id', $topProjectIds)
+            ->get()
+            ->keyBy('id');
+
+        $tableRows = $projects
+            ->take(12)
+            ->map(function (Project $project) use ($projectDetails): array {
+                /** @var Project|null $detail */
+                $detail = $projectDetails->get($project->id);
+                $comments = $detail ? $this->projectCorrectionComments($detail) : collect();
+                $latestComment = $comments->first() ?? 'Sin comentarios registrados';
+
+                return [
+                    $project->title,
+                    (string) $project->versions_count,
+                    (string) $comments->count(),
+                    (string) Str::limit($latestComment, 160),
+                ];
+            })
+            ->all();
+
+        $topProject = $projects->first();
+        $topProjectLabel = $topProject
+            ? "{$topProject->title} ({$topProject->versions_count})"
+            : 'Sin datos';
+
+        $primaryVisual = $this->makeProjectReportVisual(
+            'projects-most-versions',
+            'Proyectos con mas versiones',
+            'Ordena los proyectos segun la cantidad de versiones acumuladas.',
+            $topVersionsData,
+            'Versiones registradas'
+        );
+
+        return [
+            'reportData' => $primaryVisual['data'],
+            'segments' => $primaryVisual['segments'],
+            'visuals' => [
+                $primaryVisual,
+                $this->makeProjectReportVisual(
+                    'projects-version-distribution',
+                    'Distribucion por numero de versiones',
+                    'Agrupa los proyectos segun cuantas versiones han generado.',
+                    $versionBucketData,
+                    'Proyectos clasificados'
+                ),
+                $this->makeProjectReportVisual(
+                    'projects-correction-comments',
+                    'Cobertura de comentarios de correccion',
+                    'Indica cuantos proyectos ya registran motivos o comentarios de correccion.',
+                    $commentsPresenceData,
+                    'Proyectos revisados'
+                ),
+            ],
+            'insights' => [
+                [
+                    'label' => 'Proyectos analizados',
+                    'value' => (string) $totalProjects,
+                    'caption' => 'Proyectos considerados en la trazabilidad filtrada.',
+                ],
+                [
+                    'label' => 'Versiones registradas',
+                    'value' => (string) $totalVersions,
+                    'caption' => 'Suma de versiones creadas entre todos los proyectos.',
+                ],
+                [
+                    'label' => 'Proyecto con mas versiones',
+                    'value' => $topProjectLabel,
+                    'caption' => 'Proyecto que mas iteraciones acumula actualmente.',
+                ],
+                [
+                    'label' => 'Con comentarios de correccion',
+                    'value' => (string) $projectsWithComments,
+                    'caption' => 'Proyectos que ya tienen motivos o comentarios visibles.',
+                ],
+            ],
+            'table' => [
+                'title' => 'Detalle de trazabilidad',
+                'description' => 'Lista priorizada de proyectos con mas versiones y su comentario de correccion mas reciente cuando existe.',
+                'columns' => ['Proyecto', 'Versiones', 'Correcciones registradas', 'Ultimo comentario'],
+                'rows' => $tableRows,
+            ],
+            'exportLabel' => 'Proyectos con mas versiones',
         ];
     }
 
@@ -328,6 +717,64 @@ class ProjectController extends Controller
         ];
     }
 
+    /**
+     * Build a report visual ready for the Blade charts.
+     *
+     * @param  array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int}  $reportData
+     * @return array{
+     *     key: string,
+     *     title: string,
+     *     description: string,
+     *     total_label: string,
+     *     data: array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int},
+     *     segments: array<int, array{label: string, value: int, percentage: float, color: string}>
+     * }
+     */
+    protected function makeProjectReportVisual(
+        string $key,
+        string $title,
+        string $description,
+        array $reportData,
+        string $totalLabel
+    ): array {
+        return [
+            'key' => $key,
+            'title' => $title,
+            'description' => $description,
+            'total_label' => $totalLabel,
+            'data' => $reportData,
+            'segments' => $this->buildProjectReportSegments($reportData),
+        ];
+    }
+
+    /**
+     * @param  iterable<string, int>  $labelCounts
+     * @return array{categories: array<int, string>, values: array<int, int>, percentages: array<int, float>, total: int}
+     */
+    protected function reportDataFromLabelCounts(iterable $labelCounts): array
+    {
+        $categories = [];
+        $values = [];
+
+        foreach ($labelCounts as $label => $value) {
+            $categories[] = (string) $label;
+            $values[] = (int) $value;
+        }
+
+        $total = array_sum($values);
+        $percentages = array_map(
+            static fn (int $value): float => $total > 0 ? round(($value / $total) * 100, 2) : 0.0,
+            $values
+        );
+
+        return [
+            'categories' => $categories,
+            'values' => $values,
+            'percentages' => $percentages,
+            'total' => $total,
+        ];
+    }
+
     protected function baseProjectReportQuery(?User $user): Builder
     {
         $query = Project::query()->from('projects');
@@ -344,6 +791,46 @@ class ProjectController extends Controller
             $query->whereHas('students', static function (Builder $relation) use ($studentId) {
                 $relation->where('students.id', $studentId);
             });
+        }
+
+        return $query;
+    }
+
+    /**
+     * Build the query used by the programs and lines report.
+     */
+    protected function programsAndLinesProjectsQuery(array $filters, ?User $user): Builder
+    {
+        $query = $this->baseProjectReportQuery($user)
+            ->with([
+                'thematicArea.investigationLine',
+                'professors.cityProgram.program',
+                'students.cityProgram.program',
+            ])
+            ->select('projects.*');
+
+        $this->applyGenericProjectReportFilters($query, $filters);
+
+        if ($filters['report_search']) {
+            $this->applyProgramsAndLinesSearchFilter($query, $filters['report_search']);
+        }
+
+        return $query;
+    }
+
+    /**
+     * Build the base query used by the traceability report.
+     *
+     * @param  array<int, int>  $commentContentIds
+     */
+    protected function traceabilityProjectsQuery(array $filters, ?User $user, array $commentContentIds): Builder
+    {
+        $query = $this->baseProjectReportQuery($user)->select('projects.*');
+
+        $this->applyGenericProjectReportFilters($query, $filters);
+
+        if ($filters['report_search']) {
+            $this->applyTraceabilitySearchFilter($query, $filters['report_search'], $commentContentIds);
         }
 
         return $query;
@@ -426,6 +913,33 @@ SQL;
      */
     protected function applyProjectReportFilters(Builder $query, array $filters, string $reportKey): void
     {
+        $this->applyGenericProjectReportFilters($query, $filters);
+
+        if ($filters['report_search']) {
+            $term = '%' . $filters['report_search'] . '%';
+
+            $query->where(function (Builder $builder) use ($term, $reportKey): void {
+                $builder->where('projects.title', 'like', $term);
+
+                match ($reportKey) {
+                    'projects_by_author_type' => $builder->orWhereRaw($this->projectAuthorTypeCategoryExpression() . ' like ?', [$term]),
+                    'projects_by_thematic_area' => $builder->orWhere('thematic_areas.name', 'like', $term),
+                    'projects_by_investigation_line' => $builder
+                        ->orWhere('thematic_areas.name', 'like', $term)
+                        ->orWhere('investigation_lines.name', 'like', $term),
+                    default => $builder->orWhere('project_statuses.name', 'like', $term),
+                };
+            });
+        }
+    }
+
+    /**
+     * Apply program and date constraints shared by the report builders.
+     *
+     * @param  array{report_key:string,report_search:?string,report_from:?string,report_to:?string,report_program_id:?int}  $filters
+     */
+    protected function applyGenericProjectReportFilters(Builder $query, array $filters): void
+    {
         if ($filters['report_program_id']) {
             $programId = $filters['report_program_id'];
 
@@ -467,23 +981,127 @@ SQL;
                     });
             });
         }
+    }
 
-        if ($filters['report_search']) {
-            $term = '%' . $filters['report_search'] . '%';
+    protected function applyProgramsAndLinesSearchFilter(Builder $query, string $search): void
+    {
+        $term = '%' . $search . '%';
 
-            $query->where(function (Builder $builder) use ($term, $reportKey): void {
-                $builder->where('projects.title', 'like', $term);
+        $query->where(function (Builder $builder) use ($term): void {
+            $builder
+                ->where('projects.title', 'like', $term)
+                ->orWhereHas('thematicArea', static function (Builder $relation) use ($term): void {
+                    $relation
+                        ->where('name', 'like', $term)
+                        ->orWhereHas('investigationLine', static function (Builder $lineQuery) use ($term): void {
+                            $lineQuery->where('name', 'like', $term);
+                        });
+                })
+                ->orWhereHas('professors.cityProgram.program', static function (Builder $relation) use ($term): void {
+                    $relation->where('name', 'like', $term);
+                })
+                ->orWhereHas('students.cityProgram.program', static function (Builder $relation) use ($term): void {
+                    $relation->where('name', 'like', $term);
+                });
+        });
+    }
 
-                match ($reportKey) {
-                    'projects_by_author_type' => $builder->orWhereRaw($this->projectAuthorTypeCategoryExpression() . ' like ?', [$term]),
-                    'projects_by_thematic_area' => $builder->orWhere('thematic_areas.name', 'like', $term),
-                    'projects_by_investigation_line' => $builder
-                        ->orWhere('thematic_areas.name', 'like', $term)
-                        ->orWhere('investigation_lines.name', 'like', $term),
-                    default => $builder->orWhere('project_statuses.name', 'like', $term),
-                };
+    /**
+     * @param  array<int, int>  $commentContentIds
+     */
+    protected function applyTraceabilitySearchFilter(Builder $query, string $search, array $commentContentIds): void
+    {
+        $term = '%' . $search . '%';
+
+        $query->where(function (Builder $builder) use ($term, $commentContentIds): void {
+            $builder
+                ->where('projects.title', 'like', $term)
+                ->orWhereHas('versions.contentVersions', static function (Builder $relation) use ($term, $commentContentIds): void {
+                    if ($commentContentIds !== []) {
+                        $relation->whereIn('content_id', $commentContentIds);
+                    }
+
+                    $relation->where('value', 'like', $term);
+                })
+                ->orWhereHas('stageHistories', static function (Builder $relation) use ($term): void {
+                    $relation
+                        ->where('stage', 'returned_for_correction')
+                        ->where('notes', 'like', $term);
+                });
+        });
+    }
+
+    /**
+     * Add the conditions that determine whether a project has visible correction comments.
+     *
+     * @param  array<int, int>  $commentContentIds
+     */
+    protected function applyCorrectionCommentsPresenceFilter(Builder $query, array $commentContentIds): void
+    {
+        $query
+            ->whereHas('versions.contentVersions', static function (Builder $relation) use ($commentContentIds): void {
+                if ($commentContentIds !== []) {
+                    $relation->whereIn('content_id', $commentContentIds);
+                }
+
+                $relation->whereNotNull('value')->where('value', '!=', '');
+            })
+            ->orWhereHas('stageHistories', static function (Builder $relation): void {
+                $relation
+                    ->where('stage', 'returned_for_correction')
+                    ->whereNotNull('notes')
+                    ->where('notes', '!=', '');
             });
+    }
+
+    /**
+     * Resolve the catalog ids used to store committee correction comments.
+     *
+     * @return array<int, int>
+     */
+    protected function commentContentIds(): array
+    {
+        return Content::query()
+            ->get(['id', 'name'])
+            ->filter(function (Content $content): bool {
+                return $this->normalizeContentName($content->name) === 'comentarios';
+            })
+            ->pluck('id')
+            ->map(static fn ($id): int => (int) $id)
+            ->values()
+            ->all();
+    }
+
+    /**
+     * Extract correction comments from version content and fallback stage notes.
+     *
+     * @return \Illuminate\Support\Collection<int, string>
+     */
+    protected function projectCorrectionComments(Project $project)
+    {
+        $versionComments = $project->versions
+            ->flatMap(function (Version $version) {
+                return $version->contentVersions
+                    ->filter(function (ContentVersion $contentVersion): bool {
+                        return $this->normalizeContentName($contentVersion->content->name ?? '') === 'comentarios'
+                            && trim((string) $contentVersion->value) !== '';
+                    })
+                    ->sortByDesc('created_at')
+                    ->pluck('value');
+            })
+            ->map(static fn ($value): string => trim((string) $value))
+            ->filter()
+            ->values();
+
+        if ($versionComments->isNotEmpty()) {
+            return $versionComments;
         }
+
+        return $project->stageHistories
+            ->pluck('notes')
+            ->map(static fn ($value): string => trim((string) $value))
+            ->filter()
+            ->values();
     }
 
     /**
@@ -551,6 +1169,106 @@ SQL;
         }, $filename, [
             'Content-Type' => 'text/csv; charset=UTF-8',
         ]);
+    }
+
+    /**
+     * Render the selected report as a branded PDF document.
+     */
+    protected function downloadProjectReportPdf(array $reportState): Response
+    {
+        $reportModules = $this->projectReportModules();
+        $reportKey = (string) $reportState['reportKey'];
+        $reportLabel = (string) $reportState['reportLabel'];
+        $generatedAt = now();
+
+        $pdf = Pdf::loadView('projects.report-pdf', [
+            'reportTitle' => $reportLabel,
+            'reportDescription' => $reportModules[$reportKey]['description'] ?? 'Distribucion de proyectos.',
+            'reportKey' => $reportKey,
+            'reportGeneratedAt' => $generatedAt,
+            'reportInsights' => $reportState['insights'] ?? [],
+            'reportVisuals' => $reportState['visuals'] ?? [],
+            'reportTable' => $reportState['table'] ?? null,
+            'reportFiltersSummary' => $this->projectReportFiltersSummary($reportState['filters'] ?? []),
+            'logoDataUri' => $this->publicAssetDataUri('assets/tablar-logo.png'),
+        ])
+            ->setOptions([
+                'debugLayout' => false,
+                'debugLayoutLines' => false,
+                'debugLayoutBlocks' => false,
+                'debugLayoutInline' => false,
+                'debugLayoutPaddingBox' => false,
+                'debugCss' => false,
+                'debugKeepTemp' => false,
+                'debugText' => false,
+            ])
+            ->setPaper('a4', 'landscape');
+
+        $filename = sprintf(
+            'reporte-%s-%s.pdf',
+            Str::slug($reportKey),
+            $generatedAt->format('Ymd-His')
+        );
+
+        return $pdf->download($filename);
+    }
+
+    /**
+     * Summarize the report filters for CSV/PDF consumers.
+     *
+     * @param  array{report_key?:string,report_search?:?string,report_from?:?string,report_to?:?string,report_program_id?:?int}  $filters
+     * @return array<int, string>
+     */
+    protected function projectReportFiltersSummary(array $filters): array
+    {
+        $summary = [];
+
+        if (! empty($filters['report_search'])) {
+            $summary[] = 'Busqueda: ' . trim((string) $filters['report_search']);
+        }
+
+        if (! empty($filters['report_from'])) {
+            $summary[] = 'Desde: ' . Carbon::parse((string) $filters['report_from'])->format('d/m/Y');
+        }
+
+        if (! empty($filters['report_to'])) {
+            $summary[] = 'Hasta: ' . Carbon::parse((string) $filters['report_to'])->format('d/m/Y');
+        }
+
+        if (! empty($filters['report_program_id'])) {
+            $programName = Program::query()->whereKey((int) $filters['report_program_id'])->value('name');
+
+            if ($programName) {
+                $summary[] = 'Programa: ' . $programName;
+            }
+        }
+
+        if ($summary === []) {
+            $summary[] = 'Sin filtros adicionales.';
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Convert a public asset into a base64 data URI so Dompdf can embed it reliably.
+     */
+    protected function publicAssetDataUri(string $relativePath): ?string
+    {
+        $absolutePath = public_path($relativePath);
+
+        if (! is_file($absolutePath)) {
+            return null;
+        }
+
+        $mimeType = mime_content_type($absolutePath) ?: 'image/png';
+        $contents = file_get_contents($absolutePath);
+
+        if ($contents === false) {
+            return null;
+        }
+
+        return 'data:' . $mimeType . ';base64,' . base64_encode($contents);
     }
 
     /**
