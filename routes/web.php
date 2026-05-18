@@ -30,6 +30,8 @@ use App\Http\Controllers\ProjectionProfessorController;
 use App\Http\Controllers\ProjectionStudentController;
 use App\Http\Controllers\TeacherAssignmentController;
 use App\Http\Controllers\TeacherLoadController;
+use App\Http\Controllers\Formats\FormatoTipoController;
+use App\Http\Controllers\Formats\FormatoRegistroController;
 
 Route::get('/', function () {
     return redirect()->route('login');
@@ -175,4 +177,27 @@ Route::middleware(['auth', 'role:committee_leader'])->group(function () {
 
     Route::get('professor/projects/approved/{project}', [BankApprovedIdeasForProfessorsController::class, 'show'])
         ->name('professor.projects.approved.show');
+});
+
+// =============================================================================
+// MÓDULO DE FORMATOS — Sistema dinámico
+// =============================================================================
+
+Route::middleware(['auth'])->prefix('formatos')->name('formatos.')->group(function () {
+
+    Route::get('/', [FormatoTipoController::class, 'hub'])->name('index');
+
+    Route::middleware('role:research_staff')->resource('tipos', FormatoTipoController::class);
+
+    Route::prefix('{tipo}/registros')->name('registros.')->group(function () {
+        Route::get('/',                  [FormatoRegistroController::class, 'index'])->name('index');
+        Route::get('/crear',             [FormatoRegistroController::class, 'create'])->name('create');
+        Route::post('/',                 [FormatoRegistroController::class, 'store'])->name('store');
+        Route::get('/{registro}',        [FormatoRegistroController::class, 'show'])->name('show');
+        Route::get('/{registro}/editar', [FormatoRegistroController::class, 'edit'])->name('edit');
+        Route::put('/{registro}',        [FormatoRegistroController::class, 'update'])->name('update');
+        Route::delete('/{registro}',     [FormatoRegistroController::class, 'destroy'])->name('destroy');
+        Route::get('/{registro}/pdf',    [FormatoRegistroController::class, 'exportPdf'])->name('pdf');
+    });
+
 });
