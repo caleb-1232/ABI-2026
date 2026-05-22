@@ -1,6 +1,7 @@
 @php
     $visualSegments = $visual['segments'] ?? [];
     $visualData = $visual['data'] ?? ['categories' => [], 'values' => [], 'percentages' => [], 'total' => 0];
+    $valueLabel = $visual['value_label'] ?? 'registros';
     $maxVisualValue = max($visualData['values'] ?: [0]);
     $currentPercent = 0;
     $chartStops = [];
@@ -94,7 +95,7 @@
                                 <div class="project-report-row">
                                     <div class="project-report-row__header">
                                         <span>{{ $segment['label'] }}</span>
-                                        <span>{{ $segment['value'] }} registros</span>
+                                        <span>{{ $segment['value'] }} {{ $valueLabel }}</span>
                                     </div>
                                     <div class="project-report-row__track">
                                         <div
@@ -118,7 +119,7 @@
                         <span class="project-report-legend__swatch" style="background: {{ $segment['color'] }}"></span>
                         <div>
                             <div class="fw-semibold">{{ $segment['label'] }}</div>
-                            <div class="text-muted small">{{ $segment['value'] }} registros</div>
+                            <div class="text-muted small">{{ $segment['value'] }} {{ $valueLabel }}</div>
                         </div>
                         <div class="fw-semibold">{{ number_format($segment['percentage'], 2) }}%</div>
                     </div>
