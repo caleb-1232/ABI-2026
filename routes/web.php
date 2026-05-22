@@ -60,8 +60,6 @@ Route::middleware(['auth', 'role:research_staff'])->group(function () {
     Route::put('users/{user}/activate', [UserController::class, 'activate'])->name('users.activate');
 
     // Profile (edición solo personal de investigaciones)
-    Route::get('/perfil/editar', [PerfilController::class, 'edit'])->name('perfil.edit');
-    Route::put('/perfil', [PerfilController::class, 'update'])->name('perfil.update');
     
     //  Added routes for Departments and Cities (new addition)
     // These were added to manage departments and their related cities
@@ -125,6 +123,9 @@ Route::middleware(['auth', 'role:research_staff'])->group(function () {
 Route::middleware(['auth'])->group(function () {
     // Perfil (vista de solo lectura para cualquier usuario autenticado)
     Route::get('/perfil', [PerfilController::class, 'show'])->name('perfil.show');
+    Route::get('/perfil/editar', [PerfilController::class, 'edit'])->name('perfil.edit');
+    Route::put('/perfil', [PerfilController::class, 'update'])->name('perfil.update');
+    Route::put('/perfil/foto', [PerfilController::class, 'updatePhoto'])->name('perfil.photo.update');
 
     Route::get('projects/my-load', [TeacherLoadController::class, 'index'])
         ->middleware('role:professor,committee_leader')

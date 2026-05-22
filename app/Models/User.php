@@ -25,6 +25,7 @@ class User extends Authenticatable
     protected $fillable = [
         'name',
         'email',
+        'profile_photo_path',
         'role',
         'password',
     ];
@@ -47,6 +48,17 @@ class User extends Authenticatable
     protected $casts = [
         'email_verified_at' => 'datetime',
     ];
+
+    public function getProfilePhotoUrlAttribute(): ?string
+    {
+        $path = trim((string) ($this->profile_photo_path ?? ''));
+
+        if ($path === '') {
+            return null;
+        }
+
+        return '/' . ltrim('storage/' . str_replace('\\', '/', $path), '/');
+    }
 
     /**
      * Professor profile associated with the user.

@@ -14,7 +14,7 @@
                 <div class="col">
                     {{-- Subheading gives context to the title below. --}}
                     <div class="page-pretitle">
-                        Bienvenid@ {{ $displayName }}
+                        {{ $displayName !== '' ? 'Bienvenido, ' . $displayName : 'Bienvenido' }}
                     </div>
                     <h2 class="page-title">
                         ABI - Sistema de Gestión
@@ -33,7 +33,7 @@
                     <span class="avatar avatar-xl rounded-circle bg-white shadow-sm mb-4 p-3">
                         <img src="{{ asset('udi-logo.png') }}" alt="Logo UDI" class="img-fluid">
                     </span>
-                    <h1 class="card-title mb-3">Hola, {{ $displayName }}</h1>
+                    <h1 class="card-title mb-3">{{ $displayName !== '' ? 'Hola, ' . $displayName : 'Hola' }}</h1>
                     <p>{{ $userTypeLabel }}</p>
                     <p class="text-muted mb-4">Último acceso: <strong>{{ now()->format('d/m/Y H:i') }}</strong></p>
                     <div class="text-muted fs-5 mb-4">
